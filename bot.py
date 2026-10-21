@@ -13,7 +13,7 @@ import threading
 import traceback
 import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -47,10 +47,11 @@ USERS_FILE = os.path.join(DATA_DIR, "users_balance.json")
 CONFIG = {
     "max_per_user": 1, 
     "range_hits": {},
-    "sms_rate": 0.05  # ডিফল্ট প্রতি সফল SMS-এর রেট ($0.05)
+    "sms_rate": 0.05,       # ডিফল্ট প্রতি সফল SMS-এর রেট ($0.05)
+    "min_withdraw": 1.0     # ডিফল্ট মিনিমাম উইথড্র অ্যামাউন্ট ($1.00)
 }
 
-USER_BALANCES = {}  # {str(chat_id): balance_float}
+USER_DATA = {}  # {str(chat_id): {"balance": float, "payment_info": str}}
 
 def load_config():
     global CONFIG
@@ -69,39 +70,52 @@ def save_config():
         print(f"Could not save config.json: {e}")
 
 def load_users_data():
-    global USER_BALANCES
+    global USER_DATA
     if os.path.exists(USERS_FILE):
         try:
             with open(USERS_FILE, "r", encoding="utf-8") as f:
-                USER_BALANCES = json.load(f)
+                USER_DATA = json.load(f)
         except (json.JSONDecodeError, OSError):
-            USER_BALANCES = {}
+            USER_DATA = {}
 
 def save_users_data():
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(USER_BALANCES, f, ensure_ascii=False, indent=2)
+            json.dump(USER_DATA, f, ensure_ascii=False, indent=2)
     except OSError as e:
         print(f"Could not save users_balance.json: {e}")
 
-def get_user_balance(chat_id):
-    load_users_data()
-    return USER_BALANCES.get(str(chat_id), 0.0)
-
-def update_user_balance(chat_id, amount):
+def get_user_info(chat_id):
     load_users_data()
     cid = str(chat_id)
-    current = USER_BALANCES.get(cid, 0.0)
-    USER_BALANCES[cid] = round(current + amount, 2)
+    if cid not in USER_DATA:
+        USER_DATA[cid] = {"balance": 0.0, "payment_info": "Not Set"}
+        save_users_data()
+    # Backward compatibility if data structure was simple float
+    if isinstance(USER_DATA[cid], (int, float)):
+        USER_DATA[cid] = {"balance": float(USER_DATA[cid]), "payment_info": "Not Set"}
+        save_users_data()
+    return USER_DATA[cid]
+
+def update_user_balance(chat_id, amount):
+    info = get_user_info(chat_id)
+    info["balance"] = round(info["balance"] + amount, 2)
+    USER_DATA[str(chat_id)] = info
     save_users_data()
-    return USER_BALANCES[cid]
+    return info["balance"]
+
+def set_user_payment_info(chat_id, details):
+    info = get_user_info(chat_id)
+    info["payment_info"] = details
+    USER_DATA[str(chat_id)] = info
+    save_users_data()
 
 ACTIVE_BATCH = {}          # chat_id -> {"message_id":int, "rng":str, "label":str|None, "numbers": {number: {...}}}
-KNOWN_USERS = set()        # chat_ids that have started the bot (in-memory only)
+KNOWN_USERS = set()        # chat_ids that have started the bot
 NUMBERS_ALLOCATED = 0
 ADMIN_STATE = {}           # admin chat_id -> ("action_name", extra_data)
 USER_STATE = {}            # regular chat_id -> state
-SEEN_FEED_KEYS = set()     # (number, message, at_ms) already posted to the live-feed group
+SEEN_FEED_KEYS = set()     
 FEED_POLL_SECONDS = 5      
 
 GROUP_USERNAME = os.environ.get("GROUP_USERNAME", "-1004415108815")
@@ -112,7 +126,6 @@ BACKUP_CHANNEL_USERNAME = os.environ.get("BACKUP_CHANNEL_USERNAME", "")
 BACKUP_CHANNEL_LINK = os.environ.get("BACKUP_CHANNEL_LINK", "")
 
 services = {}
-
 AUTO_SERVICE_NAME = "🔎 Auto-Detected"
 AUTO_POLL_SECONDS = 10  
 
@@ -414,13 +427,15 @@ async def post_to_group(context, text):
     except Exception as e:
         logger.info("post_to_group failed: %s", e)
 
-# ── Bottom (persistent) keyboard with Balance & Withdraw ────────────────
+# ── Bottom Keyboards ────────────────────────────────────────────────────
 USER_ROWS = [
-    ["💰 My Balance", "💸 Withdraw"],
-    ["📱 Get Number", "📡 Browse Ranges"], 
-    ["📨 My Codes", "🔴 Live Feed"], 
-    ["ℹ️ Help"]
+    ["💰 My Balance", "💳 Payment Details"],
+    ["💸 Withdraw", "📱 Get Number"], 
+    ["📡 Browse Ranges", "📨 My Codes"], 
+    ["🔴 Live Feed", "ℹ️ Help"]
 ]
+
+CANCEL_KB = ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
 
 def main_kb(user_id):
     rows = [row[:] for row in USER_ROWS]
@@ -442,10 +457,7 @@ WELCOME = (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     KNOWN_USERS.add(chat_id)
-    load_users_data()
-    if str(chat_id) not in USER_BALANCES:
-        USER_BALANCES[str(chat_id)] = 0.0
-        save_users_data()
+    get_user_info(chat_id)
 
     if not await enforce_join_or_prompt(chat_id, context, user_id=update.effective_user.id):
         return
@@ -453,7 +465,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WELCOME, parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(update.effective_user.id)
     )
 
-# ── Get Number by service + country ─────────────────────────────────────
+# ── Service / Country UI ─────────────────────────────────────────────────
 async def show_services(update_or_query, edit=False, user_id=None):
     custom_btn = [InlineKeyboardButton("✍️ Custom Range", callback_data="customrange")]
     visible_services = {
@@ -736,20 +748,12 @@ async def start_getnum_flow(chat_id, rng, context, edit_query=None, label=None):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    cleared = False
+    USER_STATE.pop(chat_id, None)
+    ADMIN_STATE.pop(chat_id, None)
+    ACTIVE_BATCH.pop(chat_id, None)
+    await update.message.reply_text("🛑 অ্যাকশন বাতিল করা হয়েছে।", reply_markup=main_kb(update.effective_user.id))
 
-    if USER_STATE.pop(chat_id, None) is not None:
-        cleared = True
-
-    if ACTIVE_BATCH.pop(chat_id, None) is not None:
-        cleared = True
-
-    if cleared:
-        await update.message.reply_text("🛑 Stopped / cancelled.")
-    else:
-        await update.message.reply_text("Nothing in progress.")
-
-# ── Codes list ───────────────────────────────────────────────────────────
+# ── Codes & Live Feed ────────────────────────────────────────────────────
 async def codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     KNOWN_USERS.add(chat_id)
@@ -790,22 +794,22 @@ async def live_feed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 HELP_TEXT = (
     "ℹ️✨ *HOW IT WORKS* ✨\n"
     "━━━━━━━━━━━━━━━━━━\n\n"
-    "📱 *Get Number* — pick a service, then a country (or a custom range); the "
-    "bot allocates a number and waits for its code automatically\n"
-    "📡 *Browse Ranges* — see raw ranges by sender id (advanced/manual)\n"
-    "📨 *My Codes* — your last received codes\n"
-    "🔴 *Live Feed* — known working ranges, plus a link to the live group feed\n\n"
-    "💰 *My Balance & Withdraw* — check your earnings and request payouts\n"
-    "You can also type `/getnum 22501XXX` directly."
+    "📱 *Get Number* — pick a service & country to allocate a number\n"
+    "📡 *Browse Ranges* — see raw ranges by sender id\n"
+    "📨 *My Codes* — view last received codes\n"
+    "💰 *My Balance & Withdraw* — check earnings & withdraw\n"
+    "💳 *Payment Details* — set/update your withdraw account details\n\n"
+    " You can cancel any action anytime by tapping *❌ Cancel*."
 )
 
-# ── Admin panel ──────────────────────────────────────────────────────────
+# ── Admin Panel ──────────────────────────────────────────────────────────
 def admin_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Stats", callback_data="adm:stats")],
         [InlineKeyboardButton("🧩 Manage Services", callback_data="adm:services")],
-        [InlineKeyboardButton(f"🔢 Numbers per request: {CONFIG.get('max_per_user', 1)}", callback_data="adm:setlimit")],
+        [InlineKeyboardButton(f"🔢 Max Numbers: {CONFIG.get('max_per_user', 1)}", callback_data="adm:setlimit")],
         [InlineKeyboardButton(f"💵 SMS Rate: ${CONFIG.get('sms_rate', 0.05)}", callback_data="adm:setrate")],
+        [InlineKeyboardButton(f"📉 Min Withdraw: ${CONFIG.get('min_withdraw', 1.0)}", callback_data="adm:setminwithdraw")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="adm:broadcast")],
         [InlineKeyboardButton("⬅️ Close", callback_data="adm:close")],
     ])
@@ -863,7 +867,7 @@ def _range_already_known(rng):
             return True
     return False
 
-# ── Central Updates Poller (With Auto-Balance Add on SMS Receive) ────────
+# ── Central Updates Poller ───────────────────────────────────────────────
 async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await api_call("GET", "/publicapi/getupdate")
@@ -900,12 +904,10 @@ async def central_updates_poller(context: ContextTypes.DEFAULT_TYPE):
                 delivered = True
                 changed_chats.add(chat_id)
 
-                # 🎉 SMS সফলভাবে রিসিভ হওয়ায় ইউজারের ব্যালেন্স অটোমেটিক অ্যাড হবে!
                 sms_rate = CONFIG.get("sms_rate", 0.05)
                 new_bal = update_user_balance(chat_id, sms_rate)
 
                 rng, label = batch["rng"], batch.get("label")
-                service = label.split(" / ")[0] if label else None
                 again_data = f"getnum:{rng}|{label}" if label else f"getnum:{rng}"
                 notify_kb = InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔄 Get Same Country New Number", callback_data=again_data)
@@ -981,11 +983,10 @@ async def auto_poll_liveaccess(context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await api_call("GET", "/publicapi/liveaccess")
     except Exception as e:
-        logger.info("auto_poll_liveaccess: liveaccess call failed (%s) — will retry next cycle.", e)
+        logger.info("auto_poll_liveaccess: liveaccess call failed (%s) — retry next cycle.", e)
         return
 
     rows = data.get("rows", []) if data else []
-
     newly_added = []
     services.setdefault(AUTO_SERVICE_NAME, {})
     hits = CONFIG.setdefault("range_hits", {})
@@ -1057,7 +1058,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "adm:stats":
         load_users_data()
-        total_money = sum(USER_BALANCES.values())
+        total_money = sum(u.get("balance", 0) if isinstance(u, dict) else u for u in USER_DATA.values())
         text = (
             "📊 *Stats*\n\n"
             f"👥 Known users: {len(KNOWN_USERS)}\n"
@@ -1074,24 +1075,22 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "adm:setlimit":
         ADMIN_STATE[chat_id] = ("set_limit", None)
-        await query.edit_message_text(
-            f"🔢 Currently: {CONFIG.get('max_per_user', 1)} number(s) come together each time someone taps a service/country.\n"
-            f"Send a new number to change it.\nSend /cancel to abort.",
-        )
+        await query.edit_message_text(f"🔢 Send new number of numbers per request (Current: {CONFIG.get('max_per_user', 1)}):")
 
     elif data == "adm:setrate":
         ADMIN_STATE[chat_id] = ("set_rate", None)
-        await query.edit_message_text(
-            f"💵 বর্তমান প্রতি SMS রেট: ${CONFIG.get('sms_rate', 0.05)}\n\n"
-            f"নতুন রেট কত হবে সেটি সংখ্যায় লিখে পাঠান (যেমন: 0.10 বা 0.05):\nSend /cancel to abort.",
-        )
+        await query.edit_message_text(f"💵 বর্তমান প্রতি SMS রেট: ${CONFIG.get('sms_rate', 0.05)}\n\nনতুন রেট লিখে পাঠান (যেমন: 0.10):")
+
+    elif data == "adm:setminwithdraw":
+        ADMIN_STATE[chat_id] = ("set_min_withdraw", None)
+        await query.edit_message_text(f"📉 বর্তমান মিনিমাম উইথড্র সীমা: ${CONFIG.get('min_withdraw', 1.0)}\n\nনতুন সীমা লিখে পাঠান (যেমন: 2.0 বা 5.0):")
 
     elif data == "adm:services":
         await query.edit_message_text("🧩 *Manage Services*", parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb())
 
     elif data == "adm:svc_add":
         ADMIN_STATE[chat_id] = ("add_service", None)
-        await query.edit_message_text("➕ Send the new service name (e.g. Facebook).\nSend /cancel to abort.")
+        await query.edit_message_text("➕ Send new service name (e.g. Facebook):")
 
     elif data == "adm:svc_addcountry":
         if not services:
@@ -1099,7 +1098,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
             return
         buttons = [[InlineKeyboardButton(name, callback_data=f"adm:svcpick:{name}")] for name in services.keys()]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
-        await query.edit_message_text("Pick the service to add a country to:", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("Pick service to add country:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm:svcpick:"):
         service = data.split(":", 2)[2]
@@ -1112,10 +1111,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("adm:acrmanual:"):
         service = data.split(":", 2)[2]
         ADMIN_STATE[chat_id] = ("add_country_manual", service)
-        await query.edit_message_text(
-            f"✍️ Send the country and range for *{service}* like this:\n`Ivory Coast 22501XXX`\n\nSend /cancel to abort.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await query.edit_message_text(f"✍️ Send country & range for *{service}* (e.g. `Ivory Coast 22501XXX`):", parse_mode=ParseMode.MARKDOWN)
 
     elif data.startswith("adm:acrrange:"):
         _, _, service, rng = data.split(":", 3)
@@ -1130,11 +1126,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
             n += 1
         services[service][country] = rng
         save_services()
-        await query.edit_message_text(
-            f"✅ Auto-added *{country}* → `{rng}` under *{service}*.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=services_menu_kb(),
-        )
+        await query.edit_message_text(f"✅ Auto-added *{country}* → `{rng}` under *{service}*.", parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb())
 
     elif data == "adm:svc_list":
         if not services:
@@ -1157,7 +1149,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
             return
         buttons = [[InlineKeyboardButton(f"🗑 {name}", callback_data=f"adm:svcdel:{name}")] for name in services.keys()]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
-        await query.edit_message_text("Pick a service to remove:", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("Pick service to remove:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm:svcdel:"):
         service = data.split(":", 2)[2]
@@ -1171,7 +1163,7 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
             return
         buttons = [[InlineKeyboardButton(name, callback_data=f"adm:remcountrysvc:{name}")] for name in services.keys()]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:services")])
-        await query.edit_message_text("Pick the service to remove a country from:", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("Pick service to remove country:", reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm:remcountrysvc:"):
         service = data.split(":", 2)[2]
@@ -1184,15 +1176,13 @@ async def admin_callback_router(update: Update, context: ContextTypes.DEFAULT_TY
             for country in countries.keys()
         ]
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="adm:svc_remcountry")])
-        await query.edit_message_text(f"Pick a country to remove from *{service}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text(f"Pick country to remove from *{service}*:", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("adm:remcountry:"):
         _, _, service, country = data.split(":", 3)
         services.get(service, {}).pop(country, None)
         save_services()
-        await query.edit_message_text(
-            f"🗑 Removed *{country}* from *{service}*.", parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb()
-        )
+        await query.edit_message_text(f"🗑 Removed *{country}* from *{service}*.", parse_mode=ParseMode.MARKDOWN, reply_markup=services_menu_kb())
 
 async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1201,6 +1191,10 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     action, extra = ADMIN_STATE.pop(chat_id)
     text = update.message.text.strip()
+
+    if text == "❌ Cancel":
+        await update.message.reply_text("🛑 অ্যাডমিন অ্যাকশন বাতিল করা হয়েছে।", reply_markup=main_kb(update.effective_user.id))
+        return True
 
     if action == "broadcast":
         sent, failed = 0, 0
@@ -1218,7 +1212,7 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             services[text] = {}
             save_services()
-            await update.message.reply_text(f"✅ Service '{text}' added. Now add countries to it from the admin panel.")
+            await update.message.reply_text(f"✅ Service '{text}' added.")
 
     elif action == "set_limit":
         if not text.isdigit() or int(text) < 1:
@@ -1235,9 +1229,21 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 raise ValueError()
             CONFIG["sms_rate"] = rate
             save_config()
-            await update.message.reply_text(f"✅ সফলভাবে প্রতি SMS-এর রেট **${rate}** সেট করা হয়েছে।", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"✅ সফলভাবে প্রতি SMS রেট **${rate}** সেট করা হয়েছে।", parse_mode=ParseMode.MARKDOWN)
         except ValueError:
-            await update.message.reply_text("❌ দয়া করে সঠিক সংখ্যা লিখুন (যেমন: 0.05)")
+            await update.message.reply_text("❌ সঠিক সংখ্যা লিখুন (যেমন: 0.05)")
+            return True
+
+    elif action == "set_min_withdraw":
+        try:
+            min_w = float(text)
+            if min_w < 0:
+                raise ValueError()
+            CONFIG["min_withdraw"] = min_w
+            save_config()
+            await update.message.reply_text(f"✅ সফলভাবে মিনিমাম উইথড্র সীমা **${min_w}** সেট করা হয়েছে।", parse_mode=ParseMode.MARKDOWN)
+        except ValueError:
+            await update.message.reply_text("❌ সঠিক সংখ্যা লিখুন (যেমন: 1.0)")
             return True
 
     elif action == "add_country_manual":
@@ -1246,23 +1252,27 @@ async def admin_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("That service no longer exists.")
             return True
         if " " not in text:
-            await update.message.reply_text(
-                "Format: `Country Name RANGECODE` — try again from the admin panel.", parse_mode=ParseMode.MARKDOWN
-            )
+            await update.message.reply_text("Format: `Country Name RANGECODE`", parse_mode=ParseMode.MARKDOWN)
             return True
         country, rng = text.rsplit(" ", 1)
         services[service][country.strip()] = rng.strip()
         save_services()
-        await update.message.reply_text(
-            f"✅ Added {country.strip()} → `{rng.strip()}` under {service}.", parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text(f"✅ Added {country.strip()} → `{rng.strip()}` under {service}.", parse_mode=ParseMode.MARKDOWN)
 
     return True
 
-# ── Bottom-keyboard text router (With Balance & Withdraw Handlers) ───────
+# ── Bottom Keyboard Router ───────────────────────────────────────────────
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     KNOWN_USERS.add(chat_id)
+    text = update.message.text.strip()
+
+    # Universal Cancel Option
+    if text == "❌ Cancel":
+        USER_STATE.pop(chat_id, None)
+        ADMIN_STATE.pop(chat_id, None)
+        await update.message.reply_text("🛑 প্রসেস বাতিল করা হয়েছে।", reply_markup=main_kb(update.effective_user.id))
+        return
 
     if await admin_text_handler(update, context):
         return
@@ -1270,52 +1280,110 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await enforce_join_or_prompt(chat_id, context, user_id=update.effective_user.id):
         return
 
-    if USER_STATE.get(chat_id) == "awaiting_custom_range":
+    # Handle Payment Info Setting State
+    if USER_STATE.get(chat_id) == "awaiting_payment_details":
         USER_STATE.pop(chat_id, None)
-        rng = update.message.text.strip()
-        await start_getnum_flow(chat_id, rng, context)
+        set_user_payment_info(chat_id, text)
+        await update.message.reply_text(f"✅ আপনার পেমেন্ট মেথড সফলভাবে সেভ করা হয়েছে:\n\n`{text}`", parse_mode=ParseMode.MARKDOWN, reply_markup=main_kb(update.effective_user.id))
         return
 
-    # Withdraw Amount Input Handler
+    # Handle Withdraw Amount State
     if USER_STATE.get(chat_id) == "awaiting_withdraw_amount":
         try:
-            amount = float(update.message.text.strip())
-            current_bal = get_user_balance(chat_id)
+            amount = float(text)
+            user_info = get_user_info(chat_id)
+            min_withdraw = CONFIG.get("min_withdraw", 1.0)
+
             if amount <= 0:
                 await update.message.reply_text("❌ পরিমাণ অবশ্যই শূন্যের বেশি হতে হবে।")
-            elif amount > current_bal:
-                await update.message.reply_text(f"❌ পর্যাপ্ত ব্যালেন্স নেই! আপনার বর্তমান ব্যালেন্স: ${current_bal}")
+            elif amount < min_withdraw:
+                await update.message.reply_text(f"❌ মিনিমাম উইথড্র অ্যামাউন্ট **${min_withdraw}**। আপনি এর কম তুলবেন না।", parse_mode=ParseMode.MARKDOWN)
+            elif amount > user_info["balance"]:
+                await update.message.reply_text(f"❌ পর্যাপ্ত ব্যালেন্স নেই! আপনার বর্তমান ব্যালেন্স: **${user_info['balance']}**", parse_mode=ParseMode.MARKDOWN)
             else:
                 USER_STATE.pop(chat_id, None)
                 update_user_balance(chat_id, -amount)
-                await update.message.reply_text(f"✅ আপনার ${amount} টাকার উইথড্র রিকোয়েস্ট সফলভাবে জমা হয়েছে! অ্যাডমিন যাচাই করে পেমেন্ট পাঠিয়ে দেবেন।", reply_markup=main_kb(update.effective_user.id))
                 
+                await update.message.reply_text(
+                    f"✅ **${amount}** উইথড্র রিকোয়েস্ট জমা দেওয়া হয়েছে!\n\n"
+                    f"💳 পেমেন্ট অ্যাকাউন্ট: `{user_info['payment_info']}`\n"
+                    f"অ্যাডমিন শীঘ্রই চেক করে আপনার পেমেন্ট পাঠিয়ে দেবেন।", 
+                    parse_mode=ParseMode.MARKDOWN, 
+                    reply_markup=main_kb(update.effective_user.id)
+                )
+                
+                # Notify Admins with full details
                 for admin_id in ADMIN_IDS:
                     try:
                         await context.bot.send_message(
                             admin_id,
-                            f"🔔 **নতুন উইথড্র রিকোয়েস্ট!**\n\n👤 ইউজার আইডি: `{chat_id}`\n💵 পরিমাণ: `${amount}`",
+                            f"🔔 **নতুন উইথড্র রিকোয়েস্ট!**\n\n"
+                            f"👤 ইউজার আইডি: `{chat_id}`\n"
+                            f"💵 পরিমাণ: `${amount}`\n"
+                            f"💳 পেমেন্ট বিবরণ: `{user_info['payment_info']}`",
                             parse_mode=ParseMode.MARKDOWN
                         )
                     except Exception:
                         pass
         except ValueError:
-            await update.message.reply_text("❌ দয়া করে সঠিক সংখ্যা (Number) লিখুন।")
+            await update.message.reply_text("❌ দয়া করে সঠিক সংখ্যা লিখুন (যেমন: 2.5)।")
         return
 
-    text = update.message.text.strip()
+    if USER_STATE.get(chat_id) == "awaiting_custom_range":
+        USER_STATE.pop(chat_id, None)
+        await start_getnum_flow(chat_id, text, context)
+        return
 
+    # Menu Commands
     if text == "💰 My Balance":
-        bal = get_user_balance(chat_id)
-        await update.message.reply_text(f"💳 আপনার বর্তমান ব্যালেন্স: **${bal}**", parse_mode=ParseMode.MARKDOWN)
+        info = get_user_info(chat_id)
+        await update.message.reply_text(
+            f"💳 **আপনার অ্যাকাউন্ট বিবরণী:**\n\n"
+            f"💵 বর্তমান ব্যালেন্স: **${info['balance']}**\n"
+            f"💳 পেমেন্ট অ্যাকাউন্ট: `{info['payment_info']}`\n\n"
+            f"_পেমেন্ট মেথড পরিবর্তন করতে '💳 Payment Details' বাটনে চাপ দিন।_", 
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    elif text == "💳 Payment Details":
+        USER_STATE[chat_id] = "awaiting_payment_details"
+        await update.message.reply_text(
+            "✍️ আপনার টাকা নেওয়ার অ্যাকাউন্ট বিবরণী লিখে পাঠান:\n\n"
+            "উদাহরণ:\n"
+            "• `Bkash Personal: 01700000000`\n"
+            "• `Nagad Personal: 01800000000`\n"
+            "• `Binance Pay ID: 12345678`\n\n"
+            "বাতিল করতে চাইলে নিচে **❌ Cancel** চাপুন।",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=CANCEL_KB
+        )
 
     elif text == "💸 Withdraw":
-        bal = get_user_balance(chat_id)
-        if bal <= 0:
-            await update.message.reply_text("❌ উইথড্র করার মতো পর্যাপ্ত ব্যালেন্স আপনার নেই।")
+        info = get_user_info(chat_id)
+        min_w = CONFIG.get("min_withdraw", 1.0)
+
+        if info["payment_info"] == "Not Set":
+            await update.message.reply_text(
+                "⚠️ আপনার কোনো পেমেন্ট মেথড সেভ করা নেই!\n\n"
+                "উইথড্র করার আগে **💳 Payment Details** বাটনে চাপ দিয়ে আপনার বিকাশ/নগদ/বাইনান্স নাম্বার সেভ করে নিন।"
+            )
+        elif info["balance"] < min_w:
+            await update.message.reply_text(
+                f"❌ উইথড্র করার মতো পর্যাপ্ত ব্যালেন্স নেই।\n\n"
+                f"💵 আপনার ব্যালেন্স: **${info['balance']}**\n"
+                f"📉 মিনিমাম উইথড্র লিমিট: **${min_w}**", 
+                parse_mode=ParseMode.MARKDOWN
+            )
         else:
             USER_STATE[chat_id] = "awaiting_withdraw_amount"
-            await update.message.reply_text(f"💵 আপনার বর্তমান ব্যালেন্স: **${bal}**\n\nআপনি কত টাকা উইথড্র করতে চান? পরিমাণটি লিখে পাঠান (যেমন: 5 বা 10):", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                f"💵 বর্তমান ব্যালেন্স: **${info['balance']}**\n"
+                f"📉 মিনিমাম উইথড্র: **${min_w}**\n"
+                f"💳 পেমেন্ট দেওয়া হবে: `{info['payment_info']}`\n\n"
+                f"আপনি কত ডলার উইথড্র করতে চান? পরিমাণ লিখে পাঠান (যেমন: {min_w}):",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=CANCEL_KB
+            )
 
     elif text == "📱 Get Number":
         await show_services(update, user_id=update.effective_user.id)
@@ -1350,7 +1418,7 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN first.")
     if not ADMIN_IDS:
-        print("⚠️  No ADMIN_IDS set — the Admin button/menu will be unusable until you set that env var.")
+        print("⚠️ No ADMIN_IDS set.")
 
     load_services()
     load_config()
@@ -1375,10 +1443,10 @@ def main():
         app.job_queue.run_repeating(auto_poll_liveaccess, interval=AUTO_POLL_SECONDS, first=15)
         app.job_queue.run_repeating(central_updates_poller, interval=FEED_POLL_SECONDS, first=10)
     else:
-        print("⚠️  JobQueue not available — install with 'pip install \"python-telegram-bot[job-queue]\"' for auto-detection.")
+        print("⚠️ JobQueue not available.")
 
     start_health_server()
-    print("Bot running with Balance & Earning System...")
+    print("Bot running with full Withdraw, Payment Method & Min Limits...")
     app.run_polling()
 
 if __name__ == "__main__":
